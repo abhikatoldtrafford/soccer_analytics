@@ -2,6 +2,7 @@ import os
 import cv2
 import base64
 import time
+from datetime import datetime
 import json
 import numpy as np
 import tempfile
@@ -19,6 +20,8 @@ import pandas as pd
 import logging
 from pathlib import Path
 import uuid
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 
 # Import components from detect_track.py
 from detect_track import SoccerTracker, PlayerReIDTracker, JerseyOCR
@@ -55,6 +58,85 @@ TRACK_INTERVAL = 3       # Process every nth frame for tracking (to improve perf
 
 # Debug mode - set to True to print more information
 DEBUG = True
+
+# Add the two functions at the beginning of the file, right after imports
+def find_highlight_video_for_player(player_key):
+    """Find existing highlight video for a player across all directories"""
+    # Handle both GID and jersey number formats
+    jersey_prefix = f"player_{player_key}" if isinstance(player_key, int) else None
+    gid_prefix = None if isinstance(player_key, int) else f"player_GID{player_key.replace('gid_', '')}"
+    
+    # Check all possible paths
+    possible_paths = []
+    
+    # Add jersey number paths if applicable
+    if jersey_prefix:
+        possible_paths.extend([
+            f"output/highlight_clips/{jersey_prefix}_highlights.mp4",
+            f"highlights/videos/{jersey_prefix}_highlights.mp4", 
+            f"player_highlights/{jersey_prefix}_highlights.mp4",
+            f"output/highlight_clips/{jersey_prefix}_clip_1.mp4",
+            f"highlights/videos/{jersey_prefix}_clip_1.mp4"
+        ])
+    
+    # Add GID paths if applicable
+    if gid_prefix:
+        possible_paths.extend([
+            f"output/highlight_clips/{gid_prefix}_highlights.mp4",
+            f"highlights/videos/{gid_prefix}_highlights.mp4",
+            f"player_highlights/{gid_prefix}_highlights.mp4",
+            f"output/highlight_clips/{gid_prefix}_clip_1.mp4",
+            f"highlights/videos/{gid_prefix}_clip_1.mp4"
+        ])
+    
+    # Check all paths
+    for path in possible_paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            logger.info(f"Found highlight video for player {player_key}: {path}")
+            return path
+    
+    return None
+
+def scan_existing_highlight_videos():
+    """Scan for existing highlight videos and return a mapping of player IDs to video paths"""
+    highlight_videos = {}
+    
+    # Check both possible directories for highlights
+    highlight_dirs = ["highlights/videos", "output/highlight_clips"]
+    
+    for directory in highlight_dirs:
+        if not os.path.exists(directory):
+            continue
+            
+        # Scan for highlight videos
+        for filename in os.listdir(directory):
+            if filename.endswith(".mp4"):
+                # Try to extract player ID from filename
+                # Common patterns:
+                # - player_GID176_highlights.mp4 (for global IDs)
+                # - player_50_highlights.mp4 (for jersey numbers)
+                if filename.startswith("player_"):
+                    video_path = os.path.join(directory, filename)
+                    parts = filename.split("_")
+                    
+                    if len(parts) >= 2:
+                        # Check for GID pattern
+                        if "GID" in parts[1]:
+                            # Extract GID number from string like "GID176"
+                            gid_num = parts[1].replace("GID", "")
+                            if gid_num.isdigit():
+                                player_id = f"gid_{gid_num}"
+                                highlight_videos[player_id] = video_path
+                                # logger.debug(f"Found highlight for GID player: {player_id} at {video_path}")
+                        
+                        # Check for jersey number pattern
+                        elif parts[1].isdigit():
+                            player_id = int(parts[1])
+                            highlight_videos[player_id] = video_path
+                            # logger.debug(f"Found highlight for jersey player: {player_id} at {video_path}")
+    
+    logger.info(f"Found {len(highlight_videos)} existing highlight videos")
+    return highlight_videos
 
 class FootballPlayerAnalyzer:
     def __init__(self, video_path):
@@ -987,6 +1069,136 @@ class FootballPlayerTracker:
                 traceback.print_exc()
             return None
 
+    def generate_player_heatmap(self, player_id, output_path=None):
+        """Generate heatmap visualization for a specific player that matches trajectory style"""
+        if not self.tracker:
+            logger.error("Tracker not initialized")
+            return None
+        
+        try:
+            # Create output path if not provided
+            if not output_path:
+                if not os.path.exists("heatmaps"):
+                    os.makedirs("heatmaps", exist_ok=True)
+                output_path = f"heatmaps/player_{player_id}_heatmap.jpg"
+            
+            # Check if player exists in track_history_viz
+            if not hasattr(self.tracker, 'track_history_viz') or player_id not in self.tracker.track_history_viz:
+                logger.warning(f"Player {player_id} not found in trajectory history")
+                
+                # Fall back to event tracking data if trajectory history is not available
+                player_positions = []
+                for event_key, event_tracks in self.event_player_tracks.items():
+                    for frame_data in event_tracks:
+                        for track in frame_data.get('tracks', []):
+                            if track.get('global_id') == player_id:
+                                bbox = track.get('bbox')
+                                if bbox and len(bbox) == 4:
+                                    center_x = (bbox[0] + bbox[2]) / 2
+                                    center_y = (bbox[1] + bbox[3]) / 2
+                                    player_positions.append((center_x, center_y))
+                                    break
+                
+                if not player_positions:
+                    logger.error(f"No position data available for player {player_id}")
+                    return None
+            else:
+                # Get trajectory points from the same source used for trajectory visualization
+                trajectory_points = []
+                for entry in self.tracker.track_history_viz[player_id]:
+                    if entry.get('x') is not None and entry.get('y') is not None:
+                        trajectory_points.append((entry['x'], entry['y']))
+                
+                if not trajectory_points:
+                    logger.error(f"No trajectory points found for player {player_id}")
+                    return None
+                
+                player_positions = trajectory_points
+            
+            logger.info(f"Generating heatmap using {len(player_positions)} position points")
+            
+            # Create visualization canvas with the same dimensions as trajectory visualization
+            w_viz, h_viz = 1280, 720
+            
+            # Scale coordinates to match visualization canvas
+            scale_x, scale_y = w_viz / self.frame_width, h_viz / self.frame_height
+            
+            # Create grid for heatmap that matches visualization dimensions
+            grid_size = 20  # Size of each grid cell
+            height_cells = h_viz // grid_size
+            width_cells = w_viz // grid_size
+            
+            # Initialize grid with zeros
+            heatmap_grid = np.zeros((height_cells, width_cells))
+            
+            # Count occurrences in each grid cell (with scaled coordinates)
+            for x, y in player_positions:
+                # Scale coordinates
+                scaled_x = x * scale_x
+                scaled_y = y * scale_y
+                
+                if 0 <= scaled_x < w_viz and 0 <= scaled_y < h_viz:
+                    grid_x, grid_y = int(scaled_x) // grid_size, int(scaled_y) // grid_size
+                    if 0 <= grid_x < width_cells and 0 <= grid_y < height_cells:
+                        heatmap_grid[grid_y, grid_x] += 1
+            
+            # Create the heatmap visualization
+            plt.figure(figsize=(12, 8))
+            
+            # Create field background (matching trajectory visualization)
+            field_img = np.ones((h_viz, w_viz, 3), dtype=np.uint8) * 255  # White background
+            
+            # Draw field markings (same as in trajectory visualization)
+            # Draw Field
+            cv2.rectangle(field_img, (50, 50), (w_viz-50, h_viz-50), (0, 100, 0), 2)
+            cv2.line(field_img, (w_viz//2, 50), (w_viz//2, h_viz-50), (0, 100, 0), 2)
+            cv2.circle(field_img, (w_viz//2, h_viz//2), int(9.15 * scale_y * 10), (0, 100, 0), 2)  # Center circle
+            
+            # Convert to RGB for matplotlib
+            field_img_rgb = cv2.cvtColor(field_img, cv2.COLOR_BGR2RGB)
+            
+            # Show the field
+            plt.imshow(field_img_rgb)
+            
+            # Apply Gaussian smoothing to make the heatmap look nicer
+            # Use different sigma values for smoothness
+            heatmap_grid_smooth = gaussian_filter(heatmap_grid, sigma=2.0)
+            
+            # Plot the heatmap with appropriate colormap
+            # Use jet colormap for better visibility on the field
+            heatmap = plt.imshow(heatmap_grid_smooth, cmap='hot', alpha=0.7, 
+                                interpolation='bilinear', extent=[0, w_viz, h_viz, 0])
+            
+            # Add colorbar with better formatting
+            cbar = plt.colorbar(heatmap, label='Position Frequency', shrink=0.8)
+            cbar.ax.tick_params(labelsize=10)
+            
+            # Get player info for title
+            player_label = f"Player {player_id}"
+            if hasattr(self.tracker, 'reid'):
+                jersey_num, _ = self.tracker.reid.get_best_jersey(player_id)
+                if jersey_num:
+                    player_label = f"Player #{jersey_num}"
+            
+            # Add title and timestamp
+            plt.title(f"{player_label} Movement Heatmap", fontsize=14, fontweight='bold')
+            plt.text(10, h_viz-10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", 
+                    fontsize=8, color='black')
+            
+            plt.axis('off')
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            logger.info(f"Generated heatmap for player {player_id}: {output_path}")
+            return output_path
+                
+        except Exception as e:
+            logger.error(f"Error generating player heatmap: {str(e)}")
+            if DEBUG:
+                traceback.print_exc()
+            return None
+
 # Main function to use the analyzer and tracker
 def analyze_football_video(video_path, output_path=None, progress_callback=None, event_callback=None):
     """Analyze football video and save results with callbacks for live updates"""
@@ -1628,7 +1840,9 @@ def streamlit_app():
                                                 if new_video_path and os.path.exists(new_video_path) and os.path.getsize(new_video_path) > 0:
                                                     # Success - show the video
                                                     st.success("Tracking video created successfully!")
-                                                    st.video(new_video_path)
+                                                    with open(new_video_path, "rb") as f:
+                                                        video_bytes = f.read()
+                                                    st.video(video_bytes)
                                                     
                                                     # Add button to download tracking video
                                                     with open(new_video_path, "rb") as file:
@@ -1658,7 +1872,7 @@ def streamlit_app():
                                                         st.write(f"Found player in {len(frames_with_player)} frames")
                                                         
                                                         # Show a limited number of frames (max 9)
-                                                        frames_to_show = frames_with_player[:9]
+                                                        frames_to_show = frames_with_player[:20]
                                                         cols_per_row = 3
                                                         
                                                         for i in range(0, len(frames_to_show), cols_per_row):
@@ -1701,9 +1915,8 @@ def streamlit_app():
                             else:
                                 st.error("Selected player information not found.")
         
-        # Player Highlights Tab (NEW)
         with highlights_tab:
-            st.subheader("Player Highlights")
+            st.subheader("Player Highlights & Analysis")
             
             if not st.session_state.player_tracker or not hasattr(st.session_state.player_tracker, 'tracker'):
                 st.info("Please analyze a video first and track players in the Player Tracking tab.")
@@ -1711,6 +1924,7 @@ def streamlit_app():
                 # Create directories for generated files if they don't exist
                 os.makedirs("highlights", exist_ok=True)
                 os.makedirs("trajectories", exist_ok=True)
+                os.makedirs("heatmaps", exist_ok=True)
                 
                 # Scan for existing highlight videos and trajectory data
                 if not st.session_state.player_highlights:
@@ -1751,40 +1965,16 @@ def streamlit_app():
                     
                     # Now scan for existing highlight videos
                     if not highlight_data:
-                        # If we couldn't get highlight data, look for videos directly
-                        highlight_video_dirs = ["highlights/videos", "output/highlight_clips", "player_highlights"]
-                        existing_players = {}
+                        # If we couldn't get highlight data, scan for videos directly using the scan function
+                        player_videos = scan_existing_highlight_videos()
                         
-                        for dir_path in highlight_video_dirs:
-                            if os.path.exists(dir_path):
-                                for filename in os.listdir(dir_path):
-                                    if filename.endswith(".mp4") and filename.startswith("player_"):
-                                        # Extract player id from filename (player_X_highlights.mp4 or player_gid_X_highlights.mp4)
-                                        player_id_match = None
-                                        
-                                        if "gid_" in filename:
-                                            # Format: player_gid_X_highlights.mp4
-                                            parts = filename.split("_")
-                                            if len(parts) >= 3:
-                                                player_id = f"gid_{parts[2]}"
-                                                if player_id not in existing_players:
-                                                    existing_players[player_id] = {
-                                                        'total_duration_sec': 10.0,  # Default duration
-                                                        'segments': [{'duration_sec': 10.0}]  # Dummy segment
-                                                    }
-                                        else:
-                                            # Format: player_X_highlights.mp4 where X is jersey number
-                                            parts = filename.split("_")
-                                            if len(parts) >= 2:
-                                                try:
-                                                    player_id = int(parts[1])
-                                                    if player_id not in existing_players:
-                                                        existing_players[player_id] = {
-                                                            'total_duration_sec': 10.0,  # Default duration
-                                                            'segments': [{'duration_sec': 10.0}]  # Dummy segment
-                                                        }
-                                                except ValueError:
-                                                    pass  # Not a valid player ID
+                        # Create highlight data structure from the found videos
+                        existing_players = {}
+                        for player_id, video_path in player_videos.items():
+                            existing_players[player_id] = {
+                                'total_duration_sec': 10.0,  # Default duration
+                                'segments': [{'duration_sec': 10.0}]  # Dummy segment
+                            }
                         
                         # Use the discovered players
                         if existing_players:
@@ -1819,18 +2009,8 @@ def streamlit_app():
                             except:
                                 pass
                         
-                        # Check for existing highlight videos
-                        highlight_video_path = None
-                        possible_paths = [
-                            f"highlights/videos/player_{key}_highlights.mp4",
-                            f"output/highlight_clips/player_{key}_highlights.mp4",
-                            f"player_highlights/player_{key}_highlights.mp4"
-                        ]
-                        
-                        for path in possible_paths:
-                            if os.path.exists(path) and os.path.getsize(path) > 0:
-                                highlight_video_path = path
-                                break
+                        # Check for existing highlight videos using the find function
+                        highlight_video_path = find_highlight_video_for_player(key)
                         
                         # Check for existing trajectory
                         trajectory_path = None
@@ -1845,6 +2025,19 @@ def streamlit_app():
                                     trajectory_path = path
                                     break
                         
+                        # Check for existing heatmap
+                        heatmap_path = None
+                        if global_id:
+                            possible_heatmap_paths = [
+                                f"heatmaps/player_{global_id}_heatmap.jpg",
+                                f"output/player_{global_id}_heatmap.jpg"
+                            ]
+                            
+                            for path in possible_heatmap_paths:
+                                if os.path.exists(path) and os.path.getsize(path) > 0:
+                                    heatmap_path = path
+                                    break
+                        
                         # Add to player list
                         player_list.append({
                             'key': key,
@@ -1854,102 +2047,16 @@ def streamlit_app():
                             'segments': player_data.get('segments', []),
                             'display_name': f"Player #{jersey_num}" if jersey_num else f"Player {key}",
                             'highlight_video_path': highlight_video_path,
-                            'trajectory_path': trajectory_path
+                            'trajectory_path': trajectory_path,
+                            'heatmap_path': heatmap_path
                         })
                     
                     # Sort by total duration (longest first)
                     player_list.sort(key=lambda x: x['total_duration'], reverse=True)
                     
-                    # Separate top 22 players and others
-                    top_players = player_list[:22] if len(player_list) > 22 else player_list
-                    other_players = player_list[22:] if len(player_list) > 22 else []
-                    
-                    st.write(f"Found {len(player_list)} players with highlights. Showing top {len(top_players)} players.")
-                    
-                    # Create player icons grid (4 columns)
-                    st.subheader("Top Players")
-                    
-                    # Initialize player data if empty
-                    if not st.session_state.player_data:
-                        for player in player_list:
-                            player_key = player['key']
-                            st.session_state.player_data[player_key] = {
-                                'name': player['display_name'],
-                                'jersey': player['jersey_num'] if player['jersey_num'] else '',
-                                'team': 'Unassigned',
-                                'notes': '',
-                                'trajectory_path': player['trajectory_path'],
-                                'highlight_video_path': player['highlight_video_path']
-                            }
-                    
-                    # Create grid layout for players
-                    cols_per_row = 4
-                    rows = (len(top_players) + cols_per_row - 1) // cols_per_row
-                    
-                    # Create player grid
-                    for row in range(rows):
-                        cols = st.columns(cols_per_row)
-                        for col in range(cols_per_row):
-                            idx = row * cols_per_row + col
-                            if idx < len(top_players):
-                                player = top_players[idx]
-                                player_key = player['key']
-                                
-                                with cols[col]:
-                                    # Player card with indicators for available resources
-                                    has_highlight = "✓" if player['highlight_video_path'] else "✗"
-                                    has_trajectory = "✓" if player['trajectory_path'] else "✗"
-                                    
-                                    st.markdown(f"""
-                                    <div class="player-card">
-                                        <h4>{player['display_name']}</h4>
-                                        <p>Duration: {player['total_duration']:.1f}s</p>
-                                        <p>Highlight: {has_highlight} | Trajectory: {has_trajectory}</p>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    # Generic player icon
-                                    player_icon = "https://cdn-icons-png.flaticon.com/512/166/166344.png"
-                                    st.image(player_icon, width=80, caption=f"ID: {player_key}")
-                                    
-                                    # Button to view player details
-                                    if st.button(f"View Details", key=f"details_{player_key}"):
-                                        st.session_state.selected_player = player_key
-                                        st.rerun()
-                    
-                    # Display "Unclassified" section if there are additional players
-                    if other_players:
-                        st.subheader("Other Players")
-                        st.write(f"{len(other_players)} additional players with less highlight time")
-                        
-                        with st.expander("View Other Players"):
-                            # Create grid layout for other players
-                            cols_other = st.columns(4)
-                            for idx, player in enumerate(other_players):
-                                col_idx = idx % 4
-                                player_key = player['key']
-                                
-                                with cols_other[col_idx]:
-                                    # Indicator for available resources
-                                    has_highlight = "✓" if player['highlight_video_path'] else "✗"
-                                    has_trajectory = "✓" if player['trajectory_path'] else "✗"
-                                    
-                                    st.markdown(f"""
-                                    <div class="player-card">
-                                        <h5>{player['display_name']}</h5>
-                                        <p>Duration: {player['total_duration']:.1f}s</p>
-                                        <p>Highlight: {has_highlight} | Trajectory: {has_trajectory}</p>
-                                    </div>
-                                    """, unsafe_allow_html=True)
-                                    
-                                    # Button to view player details
-                                    if st.button(f"View Details", key=f"details_other_{player_key}"):
-                                        st.session_state.selected_player = player_key
-                                        st.rerun()
-                    
-                    # Display selected player details
+                    # Check if we're in player detail view or player grid view
                     if st.session_state.selected_player and st.session_state.selected_player in all_players:
-                        st.markdown("---")
+                        # PLAYER DETAIL VIEW
                         
                         # Find the player in our list
                         selected_player = None
@@ -1965,111 +2072,68 @@ def streamlit_app():
                             # Update with any path we found during scanning (in case session data is outdated)
                             if selected_player.get('trajectory_path') and not player_data.get('trajectory_path'):
                                 player_data['trajectory_path'] = selected_player['trajectory_path']
+                            
+                            if selected_player.get('heatmap_path') and not player_data.get('heatmap_path'):
+                                player_data['heatmap_path'] = selected_player['heatmap_path']
                                 
                             if selected_player.get('highlight_video_path') and not player_data.get('highlight_video_path'):
                                 player_data['highlight_video_path'] = selected_player['highlight_video_path']
                             
-                            st.subheader(f"Player Details: {selected_player['display_name']}")
+                            # Back button at the top
+                            if st.button("← Back to Player Gallery", type="primary"):
+                                st.session_state.selected_player = None
+                                st.rerun()
                             
-                            # Layout with two columns - player info and player highlights
-                            col1, col2 = st.columns([1, 2])
+                            # Player header with key info
+                            st.markdown(f"## {selected_player['display_name']}")
                             
-                            with col1:
-                                # Player information form
-                                with st.form(key=f"player_form_{st.session_state.selected_player}"):
-                                    st.subheader("Player Information")
-                                    player_name = st.text_input("Player Name", value=player_data.get('name', selected_player['display_name']))
-                                    jersey_number = st.text_input("Jersey Number", value=player_data.get('jersey', selected_player['jersey_num'] if selected_player['jersey_num'] else ''))
-                                    team = st.selectbox("Team", ["Unassigned", "Team A", "Team B"], index=["Unassigned", "Team A", "Team B"].index(player_data.get('team', 'Unassigned')))
-                                    notes = st.text_area("Notes", value=player_data.get('notes', ''))
-                                    
-                                    submit = st.form_submit_button("Save Player Information")
-                                    if submit:
-                                        # Update player data
-                                        st.session_state.player_data[st.session_state.selected_player] = {
-                                            'name': player_name,
-                                            'jersey': jersey_number,
-                                            'team': team,
-                                            'notes': notes,
-                                            'trajectory_path': player_data.get('trajectory_path'),
-                                            'highlight_video_path': player_data.get('highlight_video_path')
-                                        }
-                                        st.success("Player information updated!")
-                                
-                                # Generate trajectory visualization if not already present
-                                if not player_data.get('trajectory_path'):
-                                    # Get global ID
-                                    global_id = selected_player.get('global_id')
-                                    
-                                    if global_id:
-                                        trajectory_button = st.button("Generate Player Trajectory")
-                                        if trajectory_button:
-                                            with st.spinner("Generating trajectory visualization..."):
-                                                # Generate trajectory for this player
-                                                trajectory_path = st.session_state.player_tracker.generate_player_trajectory(
-                                                    global_id,
-                                                    f"trajectories/player_{global_id}_trajectory.jpg"
-                                                )
-                                                
-                                                if trajectory_path and os.path.exists(trajectory_path):
-                                                    # Update player data
-                                                    player_data['trajectory_path'] = trajectory_path
-                                                    st.session_state.player_data[st.session_state.selected_player]['trajectory_path'] = trajectory_path
-                                                    st.success("Trajectory generated successfully!")
-                                                    st.rerun()
-                                
-                                # Display trajectory if available
-                                if player_data.get('trajectory_path') and os.path.exists(player_data['trajectory_path']):
-                                    st.subheader("Player Trajectory")
-                                    st.image(player_data['trajectory_path'], caption="Player movement trajectory")
-                                    
-                                    # Add download button
-                                    with open(player_data['trajectory_path'], "rb") as file:
-                                        st.download_button(
-                                            label="Download Trajectory Image",
-                                            data=file,
-                                            file_name=f"player_{st.session_state.selected_player}_trajectory.jpg",
-                                            mime="image/jpeg"
-                                        )
+                            # Create tabs for different player analysis views
+                            player_tabs = st.tabs(["Highlights", "Profile", "Movement Analysis"])
+                            highlights_tab, profile_tab, analysis_tab = player_tabs
                             
-                            with col2:
-                                st.subheader("Player Highlights")
-                                
-                                # Get highlight segments
+                            # 1. HIGHLIGHTS TAB
+                            with highlights_tab:
+                                # Highlight Stats
+                                st.subheader("Highlight Statistics")
                                 player_info = all_players[st.session_state.selected_player]
                                 segments = player_info.get('segments', [])
                                 
-                                # Show stats
-                                st.write(f"Total Highlight Duration: {player_info.get('total_duration_sec', 0):.1f} seconds")
-                                st.write(f"Number of Highlight Segments: {len(segments)}")
+                                # Create stats grid
+                                stat_col1, stat_col2, stat_col3 = st.columns(3)
+                                with stat_col1:
+                                    st.metric("Total Highlight Duration", f"{player_info.get('total_duration_sec', 0):.1f}s")
+                                with stat_col2:
+                                    st.metric("Highlight Segments", f"{len(segments)}")
+                                with stat_col3:
+                                    avg_duration = player_info.get('average_segment_duration', 0)
+                                    if not avg_duration and segments:
+                                        avg_duration = sum(s.get('duration_sec', 0) for s in segments) / len(segments)
+                                    st.metric("Avg. Segment Duration", f"{avg_duration:.1f}s")
                                 
-                                # Generate highlight videos if not already done
-                                # First, check if highlights already exist in the expected directory
-                                expected_highlight_path = player_data.get('highlight_video_path')
+                                # Highlight video section
+                                st.subheader("Player Highlight Video")
                                 
-                                if not expected_highlight_path:
-                                    # Check standard locations again
-                                    possible_paths = [
-                                        f"highlights/videos/player_{st.session_state.selected_player}_highlights.mp4",
-                                        f"output/highlight_clips/player_{st.session_state.selected_player}_highlights.mp4",
-                                        f"player_highlights/player_{st.session_state.selected_player}_highlights.mp4"
-                                    ]
+                                # Check if we already have a highlight video
+                                highlight_video_path = player_data.get('highlight_video_path')
+                                
+                                if not highlight_video_path:
+                                    # Use the function to find highlight videos
+                                    highlight_video_path = find_highlight_video_for_player(st.session_state.selected_player)
                                     
-                                    for path in possible_paths:
-                                        if os.path.exists(path) and os.path.getsize(path) > 0:
-                                            expected_highlight_path = path
-                                            # Update player data with the found path
-                                            player_data['highlight_video_path'] = expected_highlight_path
-                                            st.session_state.player_data[st.session_state.selected_player]['highlight_video_path'] = expected_highlight_path
-                                            break
+                                    # Update player data with the found path
+                                    if highlight_video_path:
+                                        player_data['highlight_video_path'] = highlight_video_path
+                                        st.session_state.player_data[st.session_state.selected_player]['highlight_video_path'] = highlight_video_path
                                 
-                                # Create directories if they don't exist
-                                for dir_path in ["highlights/videos", "output/highlight_clips"]:
-                                    os.makedirs(dir_path, exist_ok=True)
-                                
-                                # Show generate button only if highlights don't exist
-                                if not expected_highlight_path:
-                                    if st.button("Generate Highlight Video"):
+                                # Show generate button or video
+                                if not highlight_video_path:
+                                    st.info("No highlight video found for this player.")
+                                    
+                                    # Create directories if they don't exist
+                                    for dir_path in ["highlights/videos", "output/highlight_clips"]:
+                                        os.makedirs(dir_path, exist_ok=True)
+                                    
+                                    if st.button("Generate Highlight Video", type="primary"):
                                         with st.spinner("Generating player highlight video..."):
                                             try:
                                                 # Use the existing function from the detect_track_v3.py module
@@ -2083,7 +2147,6 @@ def streamlit_app():
                                                     selected_identifiers=[st.session_state.selected_player],
                                                     max_clips=5,
                                                     highlight_seconds=2.0
-                                                    # Removed mode parameter since it's not supported
                                                 )
                                                 
                                                 # Check if we got some clips back
@@ -2102,74 +2165,292 @@ def streamlit_app():
                                                 if DEBUG:
                                                     st.error(traceback.format_exc())
                                 else:
-                                    st.success("Highlight video already exists")
-                                
-                                # Display highlight video if available
-                                if player_data.get('highlight_video_path') and os.path.exists(player_data['highlight_video_path']):
-                                    st.video(player_data['highlight_video_path'])
-                                    
-                                    # Add download button
-                                    with open(player_data['highlight_video_path'], "rb") as file:
-                                        st.download_button(
-                                            label="Download Highlight Video",
-                                            data=file,
-                                            file_name=f"player_{st.session_state.selected_player}_highlights.mp4",
-                                            mime="video/mp4"
-                                        )
-                                if player_data.get('highlight_video_path') and os.path.exists(player_data['highlight_video_path']):
-                                    st.video(player_data['highlight_video_path'])
-                                    
-                                    # Add download button
-                                    with open(player_data['highlight_video_path'], "rb") as file:
-                                        st.download_button(
-                                            label="Download Highlight Video",
-                                            data=file,
-                                            file_name=f"player_{st.session_state.selected_player}_highlights.mp4",
-                                            mime="video/mp4"
-                                        )
-                                    
-                                # Display individual segments if available
-                                if segments:
-                                    st.subheader("Individual Highlight Segments")
-                                    st.write(f"Showing top {min(5, len(segments))} segments sorted by duration")
-                                    
-                                    # Sort segments by duration (longest first)
-                                    sorted_segments = sorted(segments, key=lambda s: s.get('duration_sec', 0), reverse=True)
-                                    
-                                    # Show top 5 segments
-                                    for i, segment in enumerate(sorted_segments[:5]):
-                                        # Create expandable section for each segment
-                                        duration = segment.get('duration_sec', 0)
-                                        start_frame = segment.get('start_frame', 0)
-                                        end_frame = segment.get('end_frame', 0)
+                                    # Display highlight video
+                                    try:
+                                        # First read the video file into a BytesIO object
+                                        video_bytes = io.BytesIO()
+                                        with open(highlight_video_path, "rb") as f:
+                                            video_bytes.write(f.read())
                                         
-                                        with st.expander(f"Segment {i+1} - Duration: {duration:.1f}s (Frames {start_frame}-{end_frame})"):
-                                            # Show some frame images from this segment if available
-                                            track_coords = segment.get('track_coords', [])
-                                            if track_coords:
-                                                st.write(f"Player visible in {len(track_coords)} frames")
-                                                
-                                                # Show a sample of frames (max 3)
-                                                sample_size = min(3, len(track_coords))
-                                                sample_indices = np.linspace(0, len(track_coords) - 1, sample_size, dtype=int)
-                                                
-                                                frame_cols = st.columns(sample_size)
-                                                for j, idx in enumerate(sample_indices):
-                                                    coord = track_coords[idx]
-                                                    frame_num = coord.get('frame', 0)
-                                                    
-                                                    frame_cols[j].write(f"Frame {frame_num}")
-                                                    # Here we would ideally show the frame image if we had it
-                                                    # For now, just show the frame number and position
-                                                    position = coord.get('position', (0, 0))
-                                                    frame_cols[j].write(f"Position: ({position[0]:.1f}, {position[1]:.1f})")
-                                            else:
-                                                st.write("No detailed tracking coordinates available for this segment")
+                                        # Reset the position to the beginning of the buffer
+                                        video_bytes.seek(0)
+                                        
+                                        # Save to a temporary file
+                                        temp_video_path = os.path.join(tempfile.gettempdir(), f"temp_highlight_{uuid.uuid4()}.mp4")
+                                        with open(temp_video_path, "wb") as f:
+                                            f.write(video_bytes.getbuffer())
+                                        
+                                        # Display the video
+                                        st.video(temp_video_path)
+                                        
+                                        # Add download button
+                                        with open(highlight_video_path, "rb") as file:
+                                            st.download_button(
+                                                label="Download Highlight Video",
+                                                data=file,
+                                                file_name=f"player_{st.session_state.selected_player}_highlights.mp4",
+                                                mime="video/mp4"
+                                            )
+                                    except Exception as e:
+                                        st.error(f"Error displaying highlight video: {str(e)}")
+                                        if os.path.exists(highlight_video_path):
+                                            st.error(f"Video file exists but cannot be played: {highlight_video_path}")
                                 
-                                # Return to player grid
-                                if st.button("Back to Player Grid"):
-                                    st.session_state.selected_player = None
+                                # Individual highlight segments section
+                                if segments:
+                                    with st.expander("View Individual Highlight Segments"):
+                                        st.write(f"Showing top {min(5, len(segments))} segments sorted by duration")
+                                        
+                                        # Sort segments by duration (longest first)
+                                        sorted_segments = sorted(segments, key=lambda s: s.get('duration_sec', 0), reverse=True)
+                                        
+                                        # Show top 5 segments
+                                        for i, segment in enumerate(sorted_segments[:5]):
+                                            # Create expandable section for each segment
+                                            duration = segment.get('duration_sec', 0)
+                                            start_frame = segment.get('start_frame', 0)
+                                            end_frame = segment.get('end_frame', 0)
+                                            
+                                            st.markdown(f"#### Segment {i+1}")
+                                            st.markdown(f"Duration: {duration:.1f}s (Frames {start_frame}-{end_frame})")
+                                            
+                                            # Show stats for this segment
+                                            visible_frames = segment.get('visible_frames', 0)
+                                            jersey_frames = segment.get('jersey_detected_frames', 0)
+                                            jersey_visibility = segment.get('jersey_visibility_perc', 0)
+                                            
+                                            s_col1, s_col2, s_col3 = st.columns(3)
+                                            with s_col1:
+                                                st.metric("Visible Frames", visible_frames)
+                                            with s_col2:
+                                                st.metric("Jersey Detected", jersey_frames)
+                                            with s_col3:
+                                                st.metric("Jersey Visibility", f"{jersey_visibility:.1f}%")
+                                            
+                                            if i < len(sorted_segments) - 1:
+                                                st.markdown("---")
+                            
+                            # 2. PROFILE TAB
+                            with profile_tab:
+                                st.subheader("Player Information")
+                                
+                                # Player information form
+                                with st.form(key=f"player_form_{st.session_state.selected_player}"):
+                                    player_name = st.text_input("Player Name", value=player_data.get('name', selected_player['display_name']))
+                                    jersey_number = st.text_input("Jersey Number", value=player_data.get('jersey', selected_player['jersey_num'] if selected_player['jersey_num'] else ''))
+                                    team = st.selectbox("Team", ["Unassigned", "Team A", "Team B"], index=["Unassigned", "Team A", "Team B"].index(player_data.get('team', 'Unassigned')))
+                                    notes = st.text_area("Notes", value=player_data.get('notes', ''))
+                                    
+                                    submit = st.form_submit_button("Save Player Information")
+                                    if submit:
+                                        # Update player data
+                                        st.session_state.player_data[st.session_state.selected_player] = {
+                                            'name': player_name,
+                                            'jersey': jersey_number,
+                                            'team': team,
+                                            'notes': notes,
+                                            'trajectory_path': player_data.get('trajectory_path'),
+                                            'highlight_video_path': player_data.get('highlight_video_path'),
+                                            'heatmap_path': player_data.get('heatmap_path')
+                                        }
+                                        st.success("Player information updated!")
+                            
+                            # 3. MOVEMENT ANALYSIS TAB
+                            with analysis_tab:
+                                st.subheader("Player Movement Analysis")
+                                
+                                # Get global ID for movement analysis
+                                global_id = selected_player.get('global_id')
+                                
+                                if not global_id:
+                                    st.warning("Movement analysis requires player tracking data with a global ID.")
+                                else:
+                                    # Create tabs for different visualizations
+                                    viz_tabs = st.tabs(["Trajectory", "Heatmap"])
+                                    traj_tab, heat_tab = viz_tabs
+                                    
+                                    # TRAJECTORY TAB
+                                    with traj_tab:
+                                        st.subheader("Player Trajectory")
+                                        
+                                        # Check if trajectory exists
+                                        if not player_data.get('trajectory_path'):
+                                            st.info("No trajectory visualization available for this player.")
+                                            
+                                            # Generate trajectory button
+                                            if st.button("Generate Player Trajectory", type="primary"):
+                                                with st.spinner("Generating trajectory visualization..."):
+                                                    # Generate trajectory for this player
+                                                    trajectory_path = st.session_state.player_tracker.generate_player_trajectory(
+                                                        global_id,
+                                                        f"trajectories/player_{global_id}_trajectory.jpg"
+                                                    )
+                                                    
+                                                    if trajectory_path and os.path.exists(trajectory_path):
+                                                        # Update player data
+                                                        player_data['trajectory_path'] = trajectory_path
+                                                        st.session_state.player_data[st.session_state.selected_player]['trajectory_path'] = trajectory_path
+                                                        st.success("Trajectory generated successfully!")
+                                                        st.rerun()
+                                        else:
+                                            # Display existing trajectory
+                                            st.image(player_data['trajectory_path'], caption="Player movement trajectory")
+                                            
+                                            # Add download button
+                                            with open(player_data['trajectory_path'], "rb") as file:
+                                                st.download_button(
+                                                    label="Download Trajectory Image",
+                                                    data=file,
+                                                    file_name=f"player_{st.session_state.selected_player}_trajectory.jpg",
+                                                    mime="image/jpeg"
+                                                )
+                                    
+                                    # HEATMAP TAB
+                                    with heat_tab:
+                                        st.subheader("Player Heatmap")
+                                        
+                                        # Check if heatmap exists
+                                        if not player_data.get('heatmap_path'):
+                                            st.info("No heatmap visualization available for this player.")
+                                            
+                                            # Generate heatmap button
+                                            if st.button("Generate Player Heatmap", type="primary"):
+                                                with st.spinner("Generating heatmap visualization..."):
+                                                    # Generate heatmap for this player
+                                                    heatmap_path = st.session_state.player_tracker.generate_player_heatmap(
+                                                        global_id,
+                                                        f"heatmaps/player_{global_id}_heatmap.jpg"
+                                                    )
+                                                    
+                                                    if heatmap_path and os.path.exists(heatmap_path):
+                                                        # Update player data
+                                                        player_data['heatmap_path'] = heatmap_path
+                                                        st.session_state.player_data[st.session_state.selected_player]['heatmap_path'] = heatmap_path
+                                                        st.success("Heatmap generated successfully!")
+                                                        st.rerun()
+                                        else:
+                                            # Display existing heatmap
+                                            st.image(player_data['heatmap_path'], caption="Player movement heatmap")
+                                            
+                                            # Add download button
+                                            with open(player_data['heatmap_path'], "rb") as file:
+                                                st.download_button(
+                                                    label="Download Heatmap Image",
+                                                    data=file,
+                                                    file_name=f"player_{st.session_state.selected_player}_heatmap.jpg",
+                                                    mime="image/jpeg"
+                                                )
+                        
+                        else:
+                            st.error("Selected player information not found.")
+                            if st.button("Return to Player Gallery"):
+                                st.session_state.selected_player = None
+                                st.rerun()
+                    
+                    else:
+                        # PLAYER GRID VIEW
+                        
+                        # Separate top 22 players and others
+                        top_players = player_list[:22] if len(player_list) > 22 else player_list
+                        other_players = player_list[22:] if len(player_list) > 22 else []
+                        
+                        # Search box for filtering players
+                        search_query = st.text_input("Search players by jersey number or ID", "")
+                        
+                        if search_query:
+                            filtered_players = []
+                            for player in player_list:
+                                # Check jersey number
+                                if player['jersey_num'] and str(player['jersey_num']) in search_query:
+                                    filtered_players.append(player)
+                                # Check player ID
+                                elif str(player['key']) in search_query:
+                                    filtered_players.append(player)
+                                # Check display name
+                                elif search_query.lower() in player['display_name'].lower():
+                                    filtered_players.append(player)
+                            
+                            if filtered_players:
+                                st.success(f"Found {len(filtered_players)} matching players")
+                                top_players = filtered_players
+                                other_players = []
+                            else:
+                                st.warning(f"No players found matching '{search_query}'")
+                        
+                        # Player grid header
+                        if not search_query:
+                            st.markdown("### Featured Players")
+                            st.caption(f"Showing top {len(top_players)} players with the most highlight content")
+                        
+                        # Initialize player data if empty
+                        if not st.session_state.player_data:
+                            for player in player_list:
+                                player_key = player['key']
+                                st.session_state.player_data[player_key] = {
+                                    'name': player['display_name'],
+                                    'jersey': player['jersey_num'] if player['jersey_num'] else '',
+                                    'team': 'Unassigned',
+                                    'notes': '',
+                                    'trajectory_path': player['trajectory_path'],
+                                    'highlight_video_path': player['highlight_video_path'],
+                                    'heatmap_path': player['heatmap_path']
+                                }
+                        
+                        # Create player grid with consistent width cards
+                        cols_per_row = 4
+                        
+                        # Function to render player card
+                        def render_player_card(player):
+                            player_key = player['key']
+                            
+                            # Create container for the card
+                            with st.container():
+                                # Show available resources with icons
+                                has_highlight = "🎬" if player['highlight_video_path'] else "❌"
+                                has_trajectory = "🗺️" if player['trajectory_path'] else "❌"
+                                has_heatmap = "🔥" if player['heatmap_path'] else "❌"
+                                
+                                # Card with light border
+                                st.markdown(f"""
+                                <div style="padding:10px; border:1px solid #eee; border-radius:5px; margin-bottom:10px;">
+                                    <h4 style="margin-top:0;">{player['display_name']}</h4>
+                                    <p>Highlight Time: {player['total_duration']:.1f}s</p>
+                                    <p>Highlights: {has_highlight} | Trajectory: {has_trajectory} | Heatmap: {has_heatmap}</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Button to view player details
+                                if st.button(f"View Details", key=f"details_{player_key}"):
+                                    st.session_state.selected_player = player_key
                                     st.rerun()
+                        
+                        # Render player grid
+                        for i in range(0, len(top_players), cols_per_row):
+                            cols = st.columns(cols_per_row)
+                            for j in range(cols_per_row):
+                                idx = i + j
+                                if idx < len(top_players):
+                                    with cols[j]:
+                                        render_player_card(top_players[idx])
+                        
+                        # Display "Other Players" section if there are additional players
+                        if other_players and not search_query:
+                            with st.expander(f"View {len(other_players)} Additional Players"):
+                                st.caption("Players with less highlight content")
+                                
+                                # Create grid layout for other players
+                                for i in range(0, len(other_players), cols_per_row):
+                                    cols = st.columns(cols_per_row)
+                                    for j in range(cols_per_row):
+                                        idx = i + j
+                                        if idx < len(other_players):
+                                            with cols[j]:
+                                                render_player_card(other_players[idx])
+                        
+                        # Add helpful instructions at the bottom
+                        st.markdown("---")
+                        st.caption("Click on a player card to view details, highlights, and movement analysis.")
+                        st.caption("Player highlights are generated from tracked events in the match video.")
         
         # Player Stats Tab
         with stats_tab:
